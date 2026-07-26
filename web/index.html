@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>sundial — SLA working-time clock playground</title>
+    <meta
+      name="description"
+      content="An in-browser, zero-backend playground for sundial: drag a 'now' handle across a business timeline and watch working-time elapsed climb — nights, weekends and holidays never count. Escalation firings, pause/resume and a DST-safe due date, all computed by the pure Go SLA clock compiled to WebAssembly."
+    />
+    <link rel="stylesheet" href="style.css" />
+    <!-- The Go WebAssembly runtime shim. Relative path so the site works at /sundial/. -->
+    <script src="wasm_exec.js"></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <h1>sundial</h1>
+        <p class="tagline">an SLA clock — a clickable playground</p>
+        <nav class="links">
+          <a href="https://github.com/zkrebbekx/sundial" rel="noopener">Repo</a>
+          <a href="https://github.com/zkrebbekx/sundial/blob/main/docs/DESIGN.md" rel="noopener">Design</a>
+          <a href="https://pkg.go.dev/github.com/zkrebbekx/sundial" rel="noopener">API docs</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <section class="intro">
+        <p>
+          <strong>sundial</strong> measures elapsed <em>working</em> time over a
+          business schedule. A sundial only advances in daylight; an SLA clock
+          only advances during business hours — nights, weekends and holidays do
+          not count against a &ldquo;resolve within 8 working hours&rdquo; target.
+          It is a pure clock and nothing else: you supply <code>now</code>, and it
+          tells you how much working time has elapsed, when the budget runs out,
+          which escalation levels have fired, and how a pause moves the due date.
+        </p>
+        <p class="teaching-note">
+          Everything below runs in your tab over the pure library compiled to
+          WebAssembly — no backend, no network. Instants cross in as civil-time
+          strings in the schedule&rsquo;s zone (<code>2025-03-07T16:00:00</code>),
+          so a 09:00&ndash;17:00 window is eight working hours whether or not the
+          clocks changed that day. Reload to reset. Built from
+          <a href="https://github.com/zkrebbekx/sundial" rel="noopener">zkrebbekx/sundial</a>.
+        </p>
+      </section>
+
+      <section class="scenarios" aria-label="Scenarios">
+        <span class="scenarios-label">Start with a story:</span>
+        <div id="scenario-buttons" class="scenario-buttons"></div>
+      </section>
+      <p id="scenario-note" class="scenario-note" hidden></p>
+
+      <!-- ============ CENTREPIECE: the timeline ============ -->
+      <section class="panel panel-timeline" id="panel-timeline" aria-label="The SLA timeline">
+        <h2>Watch the SLA clock</h2>
+        <p class="panel-sub">
+          The band below is a business calendar in civil time. <strong>Light</strong>
+          stretches are working windows; <strong>dark</strong> stretches — nights,
+          weekends, holidays — carry no time. Drag the <b>now</b> handle and watch
+          elapsed working time climb only inside the light. The <b>due</b> marker
+          is the real <code>Add(start, budget)</code>; the bar turns red past breach.
+        </p>
+        <div class="chart-wrap">
+          <svg id="timeline-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 172" role="img" aria-label="Business-hours timeline with a draggable now handle"></svg>
+        </div>
+        <p class="drag-hint">Drag anywhere on the timeline to move <b>now</b>.</p>
+
+        <div id="now-readout" class="now-readout"></div>
+
+        <div class="readout-cards">
+          <div class="rcard elapsed"><div class="label">Elapsed working</div><div class="amount" id="el-elapsed">—</div></div>
+          <div class="rcard"><div class="label">Remaining</div><div class="amount" id="el-remaining">—</div></div>
+          <div class="rcard"><div class="label">Due at</div><div class="amount small" id="el-due">—</div></div>
+          <div class="rcard" id="status-card"><div class="label">Status</div><div class="amount small" id="el-status">—</div></div>
+        </div>
+
+        <div class="progress">
+          <div class="progress-track"><div class="progress-fill" id="prog-fill"></div></div>
+          <div class="progress-label" id="prog-label">—</div>
+        </div>
+
+        <div class="controls-grid">
+          <div class="ctl">
+            <p class="mini-label">Business schedule</p>
+            <label class="field inline"><span>Zone</span>
+              <select id="tz-select">
+                <option value="America/New_York">America/New_York</option>
+                <option value="America/Los_Angeles">America/Los_Angeles</option>
+                <option value="Europe/London">Europe/London</option>
+                <option value="Europe/Berlin">Europe/Berlin</option>
+                <option value="Asia/Kolkata">Asia/Kolkata</option>
+                <option value="Asia/Tokyo">Asia/Tokyo</option>
+                <option value="UTC">UTC</option>
+              </select>
+            </label>
+            <div id="week-editor" class="week-editor"></div>
+            <p class="mini-label" style="margin-top:12px;">Holidays</p>
+            <div class="holiday-add">
+              <input type="date" id="hol-input" aria-label="holiday date" />
+              <button id="hol-add" class="btn ghost small" type="button">+ Add holiday</button>
+            </div>
+            <div id="hol-chips" class="chips"></div>
+          </div>
+          <div class="ctl">
+            <p class="mini-label">SLA target</p>
+            <label class="field"><span>Budget (working hours)</span>
+              <input type="number" id="budget-hours" min="0" step="0.5" value="8" />
+            </label>
+            <p class="ctl-note">
+              The budget is the working time the SLA allows from the start. The
+              <b>due</b> marker is <code>Add(start, budget)</code> — the wall-clock
+              instant that much working time runs out, weekends and holidays skipped.
+            </p>
+          </div>
+        </div>
+        <p id="timeline-err" class="err-banner" hidden></p>
+      </section>
+
+      <div class="two-col">
+        <!-- ============ escalation ============ -->
+        <section class="panel" id="panel-escalation" aria-label="Escalation levels">
+          <h2>Escalation levels — write-once</h2>
+          <p class="panel-sub">
+            Ascending thresholds fire once each, at the working-time mark they name.
+            The fired-at instant is a pure function of the schedule, so dragging
+            <b>now</b> back and forth never re-fires a level or moves its instant.
+          </p>
+          <div id="level-editor" class="level-editor"></div>
+          <button id="level-add" class="btn small" type="button">+ Add level</button>
+          <div id="fire-badges" class="fire-badges"></div>
+          <p id="escalation-err" class="err-banner" hidden></p>
+        </section>
+
+        <!-- ============ pause / resume ============ -->
+        <section class="panel" id="panel-pause" aria-label="Pause and resume">
+          <h2>Pause / resume</h2>
+          <p class="panel-sub">
+            A ticket waiting on the customer freezes the clock. The excluded time
+            is pushed onto the end, so the due date moves later by exactly the
+            working time inside the pause.
+          </p>
+          <div id="pause-editor" class="pause-editor"></div>
+          <button id="pause-add" class="btn small" type="button">+ Add pause</button>
+          <div id="pause-readout" class="pause-readout"></div>
+          <ul class="teach-list">
+            <li>A completed pause shifts <b>due</b> later by exactly its working time.</li>
+            <li>A pause over a night or a weekend holds no working time, so it shifts nothing.</li>
+            <li>An open pause (no resume) freezes elapsed at the pause instant.</li>
+          </ul>
+          <p id="pause-err" class="err-banner" hidden></p>
+        </section>
+      </div>
+
+      <!-- ============ DST ============ -->
+      <section class="panel" id="panel-dst" aria-label="Daylight-saving safety">
+        <h2>DST-safe — civil time, not wall-clock</h2>
+        <p class="panel-sub">
+          Windows are defined in civil time, so 09:00&ndash;17:00 is eight working
+          hours whether or not the clocks changed. A budget crossing US
+          spring-forward lands on the right civil instant while the real span is
+          one hour shorter.
+        </p>
+        <button id="dst-load" class="btn small" type="button">Load spring-forward (2025-03-09)</button>
+        <div class="dst-cards">
+          <div class="rcard"><div class="label">Due at (civil)</div><div class="amount small" id="dst-due">—</div></div>
+          <div class="rcard"><div class="label">Real wall-clock span</div><div class="amount" id="dst-wall">—</div></div>
+          <div class="rcard"><div class="label">Working time counted</div><div class="amount" id="dst-work">—</div></div>
+        </div>
+        <p class="dst-note" id="dst-note"></p>
+      </section>
+
+      <footer class="footer">
+        <p>
+          Runs entirely in your tab over the pure SLA clock compiled to
+          WebAssembly — no backend, no network. Reload to reset. Built from
+          <a href="https://github.com/zkrebbekx/sundial" rel="noopener">zkrebbekx/sundial</a>.
+        </p>
+      </footer>
+    </main>
+
+    <div id="boot" class="boot">Loading the sundial engine…</div>
+  </body>
+</html>
